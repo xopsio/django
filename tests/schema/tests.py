@@ -2379,6 +2379,47 @@ class SchemaTests(TransactionTestCase):
         with self.assertRaises(IntegrityError):
             IntegerUnique.objects.create(i=1, j=2)
 
+    def test_alter_pk_rename_and_demote(self):
+        """
+        Regression test for rename+demotion ordering: when an AlterField both
+        renames a primary-key column and demotes it, the PK constraint must be
+        dropped against the post-rename column name (#29790 follow-up).
+        """
+        table = "schema_alter_pk_rename_and_demote"
+
+        class RenamePkModel(Model):
+            pk_field = IntegerField(primary_key=True, db_column="old_pk")
+
+            class Meta:
+                app_label = "schema"
+                apps = new_apps
+                db_table = table
+
+        self.isolated_local_models = [RenamePkModel]
+
+        with connection.schema_editor() as editor:
+            editor.create_model(RenamePkModel)
+
+        old_field = RenamePkModel._meta.get_field("pk_field")
+        new_field = IntegerField(primary_key=False, db_column="new_pk")
+        new_field.model = RenamePkModel
+        new_field.set_attributes_from_name("pk_field")
+
+        with connection.schema_editor() as editor:
+            editor.alter_field(RenamePkModel, old_field, new_field, strict=False)
+
+        # Verify old_pk is gone, new_pk exists, and the table has NO PK.
+        with connection.cursor() as cursor:
+            pk_col = connection.introspection.get_primary_key_column(cursor, table)
+            columns = [
+                col.name for col in connection.introspection.get_table_description(cursor, table)
+            ]
+        self.assertNotIn("old_pk", columns)
+        self.assertIn("new_pk", columns)
+        # SQLite may recreate the table with a new implicit "id" primary key.
+        # The demoted "new_pk" column must not remain the primary key.
+        self.assertNotEqual(pk_col, "new_pk")
+
     def test_rename(self):
         """
         Tests simple altering of fields

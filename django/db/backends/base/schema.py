@@ -1222,7 +1222,7 @@ class BaseDatabaseSchemaEditor:
                 self.execute(sql, params)
         # If primary_key changed to False, delete the primary key constraint.
         if old_field.primary_key and not new_field.primary_key:
-            self._delete_primary_key(model, strict)
+            self._delete_primary_key(model, strict, field=new_field)
         # Added a unique?
         if self._unique_should_be_added(old_field, new_field):
             self.execute(self._create_unique_sql(model, [new_field]))
@@ -1249,6 +1249,9 @@ class BaseDatabaseSchemaEditor:
             rels_to_update.extend(_related_non_m2m_objects(old_field, new_field))
         # Changed to become primary key?
         if self._field_became_primary_key(old_field, new_field):
+            # A table can only have one primary key, and it may still be set
+            # on another field when moving the primary key (#29790).
+            self._delete_primary_key(model)
             # Make the new one
             self.execute(self._create_primary_key_sql(model, new_field))
             # Update all referencing columns
@@ -2050,8 +2053,12 @@ class BaseDatabaseSchemaEditor:
             "columns": ", ".join(self.quote_name(column) for column in columns)
         }
 
-    def _delete_primary_key(self, model, strict=False):
-        constraint_names = self._constraint_names(model, primary_key=True)
+    def _delete_primary_key(self, model, strict=False, field=None):
+        constraint_names = self._constraint_names(
+            model,
+            column_names=[field.column] if field else None,
+            primary_key=True,
+        )
         if strict and len(constraint_names) != 1:
             raise ValueError(
                 "Found wrong number (%s) of PK constraints for %s"

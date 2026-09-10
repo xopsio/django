@@ -1,5 +1,7 @@
 import math
+import uuid
 from decimal import Decimal
+from unittest import skipIf
 
 from django.core.exceptions import FieldDoesNotExist
 from django.db import IntegrityError, connection, migrations, models, transaction
@@ -3005,6 +3007,96 @@ class OperationTests(OperationTestBase):
         operation.state_forwards(app_label, new_state)
         with connection.schema_editor() as editor:
             operation.database_forwards(app_label, editor, project_state, new_state)
+
+    @skipIf(
+        connection.vendor == "sqlite",
+        "SQLite raises OperationalError: near 'AUTOINCREMENT': syntax error "
+        "when AlterField recreates the table for primary_key=True.",
+    )
+    def test_alter_field_promote_uuid_to_pk_while_old_pk_exists(self):
+        """
+        Regression test for ticket #29790: when the primary key moves from one
+        field to another, altering the field that gains the primary key first
+        (while the old pk still exists) should not raise "multiple primary keys
+        for table ... are not allowed" on PostgreSQL.
+        """
+
+        app_label = "test_alterpkpromote"
+        table_name = f"{app_label}_pony"
+        test_uuid = uuid.UUID("12345678-1234-1234-1234-123456789abc")
+
+        # Create model with id (AutoField PK) and uuid (UUIDField).
+        state_after_create = self.apply_operations(
+            app_label,
+            ProjectState(),
+            [
+                migrations.CreateModel(
+                    "Pony",
+                    [
+                        ("id", models.AutoField(primary_key=True)),
+                        ("uuid", models.UUIDField()),
+                    ],
+                ),
+            ],
+        )
+
+        # Create a row via ORM using the model rendered from the correct state.
+        Pony = state_after_create.apps.get_model(app_label, "Pony")
+        pony = Pony.objects.create(uuid=test_uuid)
+        pony_id = pony.id
+
+        # Step 1: Promote uuid to primary key first.
+        op_promote = migrations.AlterField(
+            "Pony", "uuid", models.UUIDField(primary_key=True)
+        )
+        state_after_promote = state_after_create.clone()
+        op_promote.state_forwards(app_label, state_after_promote)
+        with connection.schema_editor() as editor:
+            op_promote.database_forwards(
+                app_label, editor, state_after_create, state_after_promote
+            )
+
+        # Step 2: Demote id from primary key.
+        op_demote = migrations.AlterField(
+            "Pony", "id", models.IntegerField(primary_key=False)
+        )
+        state_after_demote = state_after_promote.clone()
+        op_demote.state_forwards(app_label, state_after_demote)
+        with connection.schema_editor() as editor:
+            op_demote.database_forwards(
+                app_label, editor, state_after_promote, state_after_demote
+            )
+
+        # Verify forward: PK is on uuid, id still exists, UUID preserved.
+        with connection.cursor() as cursor:
+            pk_col = connection.introspection.get_primary_key_column(cursor, table_name)
+        self.assertEqual(pk_col, "uuid")
+        self.assertColumnExists(table_name, "id")
+        Pony = state_after_demote.apps.get_model(app_label, "Pony")
+        pony = Pony.objects.get()
+        self.assertEqual(pony.uuid, test_uuid)
+        self.assertEqual(pony.id, pony_id)
+
+        # Reverse: restore id as PK.
+        with connection.schema_editor() as editor:
+            op_demote.database_backwards(
+                app_label, editor, state_after_demote, state_after_promote
+            )
+
+        # Reverse: restore uuid as non-PK.
+        with connection.schema_editor() as editor:
+            op_promote.database_backwards(
+                app_label, editor, state_after_promote, state_after_create
+            )
+
+        # Verify reverse: PK restored to id, uuid preserved.
+        with connection.cursor() as cursor:
+            pk_col = connection.introspection.get_primary_key_column(cursor, table_name)
+        self.assertEqual(pk_col, "id")
+        Pony = state_after_create.apps.get_model(app_label, "Pony")
+        pony = Pony.objects.get()
+        self.assertEqual(pony.uuid, test_uuid)
+        self.assertEqual(pony.id, pony_id)
 
     @skipUnlessDBFeature("supports_foreign_keys")
     def test_alter_field_reloads_state_on_fk_with_to_field_target_type_change(self):
